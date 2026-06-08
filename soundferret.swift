@@ -1,14 +1,12 @@
 #!/usr/bin/env swift
-// whoplays — list macOS processes currently emitting audio.
+// soundferret — list macOS processes currently emitting (or capturing) audio
+// and the output device each is routed to.
 // Uses CoreAudio process objects (macOS 14.2+).
 //   kAudioProcessPropertyIsRunningOutput — bool, engine running for process.
+//   kAudioProcessPropertyDevices         — per-process device list (ROUTE col).
 // --rms: tap each emitting PID for ~150 ms, compute RMS / dBFS to filter silence.
 //        First run prompts TCC for "System Audio Recording" — must approve.
-// Usage:
-//   whoplays                  # one-shot
-//   whoplays --watch [secs]   # refreshing
-//   whoplays --rms            # one-shot with sample-level RMS
-//   whoplays --watch --rms    # both
+// Run `soundferret --help` for full usage.
 
 import CoreAudio
 import Foundation
@@ -59,6 +57,64 @@ func getCFString(_ obj: AudioObjectID, _ sel: AudioObjectPropertySelector) -> St
     return s as String
 }
 
+func getProcessOutputDevices(_ obj: AudioObjectID) -> [AudioObjectID] {
+    var a = AudioObjectPropertyAddress(
+        mSelector: AudioObjectPropertySelector(kAudioProcessPropertyDevices),
+        mScope: AudioObjectPropertyScope(kAudioDevicePropertyScopeOutput),
+        mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(obj, &a, 0, nil, &size) == noErr, size > 0 else { return [] }
+    let count = Int(size) / MemoryLayout<AudioObjectID>.size
+    var devs = [AudioObjectID](repeating: 0, count: count)
+    guard AudioObjectGetPropertyData(obj, &a, 0, nil, &size, &devs) == noErr else { return [] }
+    return devs
+}
+
+func deviceIsRunning(_ dev: AudioObjectID) -> Bool {
+    getBool(dev, AudioObjectPropertySelector(kAudioDevicePropertyDeviceIsRunning))
+}
+
+// Skip private aggregates (soundferret creates them for --rms taps).
+func isPrivateAggregate(_ dev: AudioObjectID) -> Bool {
+    var a = addr(AudioObjectPropertySelector(kAudioObjectPropertyClass))
+    var cls: AudioClassID = 0
+    var size = UInt32(MemoryLayout<AudioClassID>.size)
+    guard AudioObjectGetPropertyData(dev, &a, 0, nil, &size, &cls) == noErr,
+          cls == kAudioAggregateDeviceClassID else { return false }
+    // 'priv' — kAudioAggregateDevicePropertyIsPrivate, not exposed to Swift.
+    var aP = addr(AudioObjectPropertySelector(0x70726976))
+    var v: UInt32 = 0
+    var s2 = UInt32(MemoryLayout<UInt32>.size)
+    guard AudioObjectGetPropertyData(dev, &aP, 0, nil, &s2, &v) == noErr else { return false }
+    return v != 0
+}
+
+func deviceName(_ dev: AudioObjectID) -> String {
+    getCFString(dev, AudioObjectPropertySelector(kAudioObjectPropertyName)) ?? "device#\(dev)"
+}
+
+// Determine which of process's output devices is actually emitting.
+// Rules:
+//   1 device           -> "name*"
+//   N, exactly 1 running -> "running*, other, other"
+//   N, 0 or >1 running -> "? d1, d2, d3"
+//   none               -> "-"
+func formatRoute(_ obj: AudioObjectID) -> String {
+    let all = getProcessOutputDevices(obj).filter { !isPrivateAggregate($0) }
+    if all.isEmpty { return "-" }
+    let entries = all.map { (id: $0, name: deviceName($0), running: deviceIsRunning($0)) }
+    if entries.count == 1 {
+        return "\(entries[0].name)*"
+    }
+    let running = entries.filter { $0.running }
+    if running.count == 1 {
+        let primary = running[0]
+        let others = entries.filter { $0.id != primary.id }.map { $0.name }
+        return ([primary.name + "*"] + others).joined(separator: ", ")
+    }
+    return "? " + entries.map { $0.name }.joined(separator: ", ")
+}
+
 func procName(_ pid: pid_t) -> String {
     let p = Process()
     p.launchPath = "/bin/ps"
@@ -94,7 +150,7 @@ func sampleRMS(processObjID: AudioObjectID, duration: Double = 0.15) -> (Float, 
 
     let aggDesc: [String: Any] = [
         kAudioAggregateDeviceUIDKey: UUID().uuidString,
-        kAudioAggregateDeviceNameKey: "whoplays-rms",
+        kAudioAggregateDeviceNameKey: "soundferret-rms",
         kAudioAggregateDeviceIsPrivateKey: 1,
         kAudioAggregateDeviceIsStackedKey: 0,
         kAudioAggregateDeviceTapAutoStartKey: 1,
@@ -200,6 +256,7 @@ struct Emitter {
     let bundle: String?
     let output: Bool
     let input: Bool
+    let route: String
     var rmsDB: Float? = nil
 }
 
@@ -216,7 +273,8 @@ func scan(withRMS: Bool) -> [Emitter] {
             name: procName(pid),
             bundle: getCFString(obj, AudioObjectPropertySelector(kAudioProcessPropertyBundleID)),
             output: outActive,
-            input: inActive
+            input: inActive,
+            route: outActive ? formatRoute(obj) : "-"
         )
         if withRMS, outActive, #available(macOS 14.2, *) {
             if let (_, db) = sampleRMS(processObjID: obj) {
@@ -243,7 +301,7 @@ func renderLines(_ rows: [Emitter], showRMS: Bool) -> [String] {
     var out: [String] = []
     var header = "\(pad("PID", 7)) \(pad("I/O", 4)) \(pad("NAME", 28))"
     if showRMS { header += " \(pad("dBFS", 6))" }
-    header += " BUNDLE"
+    header += " \(pad("BUNDLE", 32)) ROUTE"
     out.append(header)
     for r in rows {
         var io = ""
@@ -251,7 +309,7 @@ func renderLines(_ rows: [Emitter], showRMS: Bool) -> [String] {
         if r.input  { io += "I" }
         var line = "\(pad(String(r.pid), 7)) \(pad(io, 4)) \(pad(r.name, 28))"
         if showRMS { line += " \(pad(fmtDB(r.rmsDB), 6))" }
-        line += " \(r.bundle ?? "-")"
+        line += " \(pad(r.bundle ?? "-", 32)) \(r.route)"
         out.append(line)
     }
     return out
@@ -262,6 +320,38 @@ func render(_ rows: [Emitter], showRMS: Bool) {
 }
 
 let args = Array(CommandLine.arguments.dropFirst())
+
+if args.contains("-h") || args.contains("--help") {
+    let help = """
+    soundferret — list macOS processes currently emitting (or capturing) audio,
+    and the output device each is routed to.
+
+    Usage:
+      soundferret                 one-shot scan
+      soundferret --watch [secs]  refresh every <secs> (default 1.0)
+      soundferret --rms           sample each emitter ~150 ms, print dBFS
+      soundferret --debug         verbose tap diagnostics on stderr
+      soundferret -h, --help      this help
+
+    Columns:
+      PID     process id
+      I/O     O=output active, I=input active
+      NAME    process short name
+      dBFS    (--rms only) sample-level RMS in dBFS, -inf = silent
+      BUNDLE  CFBundleIdentifier if known, else '-'
+      ROUTE   output device(s); '*' marks the one actually emitting,
+              '? d1, d2' when emitting device cannot be determined
+
+    Notes:
+      Requires macOS 14.2+ (CoreAudio process objects).
+      --rms triggers a TCC prompt for 'System Audio Recording' on first use;
+      deny → dBFS column shows '-'.
+      Ctrl-C exits --watch mode cleanly (restores terminal).
+    """
+    print(help)
+    exit(0)
+}
+
 let watch = args.contains("--watch")
 let rms   = args.contains("--rms")
 debugMode = args.contains("--debug")
@@ -302,7 +392,7 @@ if watch {
     // Background thread for rendering; main thread runs the dispatch loop so signal source delivers.
     DispatchQueue.global(qos: .userInitiated).async {
         while true {
-            let header = "whoplays — \(Date())\(rms ? "  [rms]" : "")  (Ctrl-C to quit)"
+            let header = "soundferret — \(Date())\(rms ? "  [rms]" : "")  (Ctrl-C to quit)"
             let lines = [header] + renderLines(scan(withRMS: rms), showRMS: rms)
             var frame = cursorHome
             for line in lines { frame += line + clearEOL + "\n" }
